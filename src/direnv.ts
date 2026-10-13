@@ -115,9 +115,9 @@ export async function find(): Promise<string> {
 }
 
 export async function dump(cwdOverride?: string): Promise<Data> {
+	let stdout: string
 	try {
-		const { stdout } = await direnv(['export', 'json'], undefined, cwdOverride)
-		return parse(stdout)
+		stdout = (await direnv(['export', 'json'], undefined, cwdOverride)).stdout
 	} catch (e) {
 		if (isStdio(e)) {
 			const found = /direnv: error (?<path>.+) is blocked./.exec(e.stderr)
@@ -128,6 +128,39 @@ export async function dump(cwdOverride?: string): Promise<Data> {
 		}
 		throw e
 	}
+	// since direnv 2.33 denied files unload silently instead of failing
+	const denied = await deniedPath(cwdOverride)
+	if (denied !== undefined) {
+		throw new BlockedError(denied, parse(stdout, isInternal))
+	}
+	return parse(stdout)
+}
+
+const enum Allowed {
+	denied = 2,
+}
+
+type Status = {
+	state?: {
+		foundRC?: {
+			allowed?: number
+			path?: string
+		} | null
+	}
+}
+
+async function deniedPath(cwdOverride?: string): Promise<string | undefined> {
+	let status: Status
+	try {
+		const { stdout } = await direnv(['status', '--json'], undefined, cwdOverride)
+		status = JSON.parse(stdout) as Status
+	} catch (_) {
+		// older direnv has no `status --json`, but it reports denied files from `export`
+		return
+	}
+	const found = status.state?.foundRC
+	if (found?.allowed !== Allowed.denied) return
+	return found.path
 }
 
 function parse(stdout: string, predicate: (key: string) => boolean = () => true): Data {
