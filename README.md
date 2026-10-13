@@ -57,6 +57,24 @@ since direnv executes arbitrary shell script.**
 *	"direnv: Load .envrc file"
 	loads a custom environment from the specified .envrc file
 
+### Startup and Restarting Extensions
+
+Other extensions read the environment when they start,
+so they only see the custom environment if it is loaded by then.
+While VS Code starts, this extension waits up to `direnv.startup.timeout`
+milliseconds (3 seconds by default) for direnv.
+Other extensions are paused while waiting,
+and if direnv takes longer it keeps loading in the background.
+
+When the environment changes after other extensions started,
+the extension offers restarting them, naming the affected extensions.
+Built-in extensions are ignored.
+Enable `direnv.restart.automatic` to restart without asking.
+It still asks during debug sessions,
+and when the environment changes again right after restarting,
+which usually means some variable changes on every load.
+The `direnv` output lists the changed variables.
+
 ### Status Item
 
 The extension displays a status icon

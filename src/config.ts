@@ -79,4 +79,7 @@ export default section([root], {
 	restart: {
 		automatic: value(false),
 	},
+	startup: {
+		timeout: value(3000),
+	},
 })
