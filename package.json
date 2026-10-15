@@ -74,7 +74,13 @@
 				"direnv.restart.automatic": {
 					"type": "boolean",
 					"default": false,
-					"description": "Automatically restart extension host upon environment changes"
+					"description": "Automatically restart extension host upon environment changes. Only extensions that were active before the change need a restart, built-in extensions are ignored."
+				},
+				"direnv.startup.timeout": {
+					"type": "number",
+					"default": 3000,
+					"minimum": 0,
+					"description": "Milliseconds to wait for direnv while extensions start, so that they start with the custom environment instead of needing a restart. Other extensions are paused while waiting. If direnv takes longer it keeps loading in the background. Set to 0 to never wait."
 				}
 			}
 		},
@@ -157,7 +163,7 @@
 		"@types/vscode": "1.71.x",
 		"@typescript-eslint/eslint-plugin": "^7.17.0",
 		"@typescript-eslint/parser": "^7.17.0",
-		"@vscode/test-electron": "^2.4.1",
+		"@vscode/test-electron": "^3.1.0",
 		"@vscode/vsce": "^2.31.1",
 		"esbuild": "^0.23.1",
 		"eslint": "^8.57.0",

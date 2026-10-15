@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
 ## [Unreleased]
+### Added
+- Wait for direnv while extensions start (`direnv.startup.timeout`),
+  so extensions activated after this one don't need a restart
+### Changed
+- Only offer restarting extensions when other (non built-in) extensions
+  were already active, and name them
+- Don't restart automatically during debug sessions
+  or again right after restarting, ask instead
+- Commands finish once the environment is loaded
+- Keep file watchers for unchanged paths when reloading
+### Fixed
+- Detect .envrc files blocked with `direnv deny` (direnv 2.33 and later)
+- Report errors from direnv instead of loading forever
 
 ## [0.17.0] - 2024-03-12
 ### Added

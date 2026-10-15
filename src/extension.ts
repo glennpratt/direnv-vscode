@@ -11,36 +11,40 @@ const enum Cached {
 	checksum = 'direnv.checksum',
 	environment = 'direnv.environment',
 	cwdOverride = 'direnv.cwdOverride',
+	restartedAt = 'direnv.restartedAt',
 }
 type EnvCache = [string, string | undefined][]
 
 const installationUri = vscode.Uri.parse('https://direnv.net/docs/installation.html')
 
+// environment changes this soon after restarting suggest a restart loop
+const restartLoopWindow = 60_000
+
+type Extensions = vscode.Extension<unknown>[]
+
 class Direnv implements vscode.Disposable {
 	private output = vscode.window.createOutputChannel('direnv')
 	private backup = new Map<string, string | undefined>()
-	private willLoad = new vscode.EventEmitter<void>()
 	private didLoad = new vscode.EventEmitter<Data>()
 	private loaded = new vscode.EventEmitter<void>()
 	private failed = new vscode.EventEmitter<unknown>()
 	private blocked = new vscode.EventEmitter<direnv.BlockedError>()
 	private viewBlocked = new vscode.EventEmitter<string>()
-	private didUpdate = new vscode.EventEmitter<void>()
+	private didUpdate = new vscode.EventEmitter<Extensions>()
 	private blockedPath?: string
 	private cwdOverride?: string
-	private watchers = vscode.Disposable.from()
+	private watchers = new Map<string, vscode.Disposable>()
 
 	constructor(
 		private context: vscode.ExtensionContext,
 		private status: status.Item,
 	) {
-		this.willLoad.event(() => this.onWillLoad())
 		this.didLoad.event((e) => this.onDidLoad(e))
 		this.loaded.event(() => this.onLoaded())
 		this.failed.event((e) => this.onFailed(e))
 		this.blocked.event((e) => this.onBlocked(e))
 		this.viewBlocked.event((e) => this.onViewBlocked(e))
-		this.didUpdate.event(() => this.onDidUpdate())
+		this.didUpdate.event((e) => this.onDidUpdate(e))
 	}
 
 	private get environment() {
@@ -54,20 +58,22 @@ class Direnv implements vscode.Disposable {
 	dispose() {
 		this.output.dispose()
 		this.status.dispose()
-		this.watchers.dispose()
+		for (const watcher of this.watchers.values()) {
+			watcher.dispose()
+		}
 	}
 
 	async allow(path: string) {
 		await this.try(async () => {
 			await direnv.allow(path)
-			this.willLoad.fire()
+			await this.onWillLoad()
 		})
 	}
 
 	async block(path: string) {
 		await this.try(async () => {
 			await direnv.block(path)
-			this.willLoad.fire()
+			await this.onWillLoad()
 		})
 	}
 
@@ -120,7 +126,7 @@ class Direnv implements vscode.Disposable {
 			return
 		}
 		this.cwdOverride = path.dirname(uri.path)
-		this.willLoad.fire()
+		await this.try(() => this.onWillLoad())
 	}
 
 	async reload() {
@@ -137,6 +143,24 @@ class Direnv implements vscode.Disposable {
 	restore() {
 		const data = this.restoreCache()
 		this.updateEnvironment(data)
+		// wait for direnv now so that extensions activated after us don't need a restart
+		const timeout = config.startup.timeout.get()
+		const folder = this.cwdOverride ?? direnv.cwd()
+		const start = Date.now()
+		const started = direnv.dumpBlocking(timeout, this.cwdOverride)
+		if (started.data === undefined) {
+			this.output.appendLine(
+				`startup: no environment for ${folder} within ${timeout}ms, loading in the background`,
+			)
+			void this.load(started.running)
+			return
+		}
+		const changes = [...started.data.keys()].filter((it) => !isInternal(it)).length
+		this.output.appendLine(
+			`startup: direnv finished in ${Date.now() - start}ms for ${folder}, ${changes} variables changed`,
+		)
+		this.didLoad.fire(started.data)
+		// let the regular load handle blocked files and catch up on changes
 		void this.load()
 	}
 
@@ -185,11 +209,16 @@ class Direnv implements vscode.Disposable {
 	}
 
 	private updateWatchers(data?: Data) {
-		this.watchers.dispose()
-		if (config.watchForChanges.get()) {
-			this.watchers = vscode.Disposable.from(
-				...direnv.watchedPaths(data).map((it) => this.createWatcher(it)),
-			)
+		// keep watchers for unchanged paths, new ones miss changes until they're live
+		const paths = new Set(config.watchForChanges.get() ? direnv.watchedPaths(data) : [])
+		for (const [file, watcher] of this.watchers) {
+			if (paths.has(file)) continue
+			watcher.dispose()
+			this.watchers.delete(file)
+		}
+		for (const file of paths) {
+			if (this.watchers.has(file)) continue
+			this.watchers.set(file, this.createWatcher(file))
 		}
 	}
 
@@ -237,10 +266,10 @@ class Direnv implements vscode.Disposable {
 		}
 	}
 
-	private async load() {
+	private async load(running?: Promise<direnv.Stdio>) {
 		await this.try(async () => {
 			await direnv.test()
-			this.willLoad.fire()
+			await this.onWillLoad(running)
 		})
 	}
 
@@ -252,25 +281,37 @@ class Direnv implements vscode.Disposable {
 		}
 	}
 
-	private async onWillLoad() {
+	private async onWillLoad(running?: Promise<direnv.Stdio>) {
 		this.blockedPath = undefined
 		this.status.update(status.State.loading)
 		try {
-			const data = await direnv.dump(this.cwdOverride)
+			const data = await direnv.dump(this.cwdOverride, running)
 			this.didLoad.fire(data)
 		} catch (err) {
-			if (err instanceof direnv.BlockedError) {
-				this.blocked.fire(err)
-			}
+			if (!(err instanceof direnv.BlockedError)) throw err
+			this.blocked.fire(err)
 		}
 	}
 
 	private async onDidLoad(data: Data) {
+		// extensions active now started with the previous environment
+		const stale = this.activeExtensions()
 		this.updateEnvironment(data)
 		await this.updateCache()
 		this.loaded.fire()
 		if ([...data.keys()].every(isInternal)) return
-		this.didUpdate.fire()
+		this.didUpdate.fire(stale)
+	}
+
+	private activeExtensions(): Extensions {
+		// built-in extensions don't usually depend on the custom environment
+		const builtin = path.join(vscode.env.appRoot, 'extensions') + path.sep
+		return vscode.extensions.all.filter(
+			(it) =>
+				it.isActive &&
+				it.id !== this.context.extension.id &&
+				!it.extensionUri.fsPath.startsWith(builtin),
+		)
 	}
 
 	private onLoaded() {
@@ -360,24 +401,54 @@ class Direnv implements vscode.Disposable {
 		}
 	}
 
-	private async onDidUpdate() {
-		if (await this.shouldRestart()) {
-			if (vscode.env.remoteName === undefined) {
-				await vscode.commands.executeCommand('workbench.action.restartExtensionHost')
-			} else {
-				await vscode.commands.executeCommand('workbench.action.reloadWindow')
-			}
+	private async onDidUpdate(stale: Extensions) {
+		if (stale.length === 0) {
+			this.output.appendLine('no restart needed: no other extensions were active')
+			return
+		}
+		const names = stale.map((it) => nameOf(it))
+		this.output.appendLine(`active before the environment changed: ${names.join(', ')}`)
+		if (await this.shouldRestart(names)) {
+			await this.restart()
 		}
 	}
 
-	private async shouldRestart() {
-		if (config.restart.automatic.get()) return true
-		const choice = await vscode.window.showWarningMessage(
-			`direnv: Environment updated. Restart extensions?`,
-			'Restart',
-		)
+	private async shouldRestart(names: string[]) {
+		const restartedAt = this.cache.get<number>(Cached.restartedAt) ?? 0
+		const looping = Date.now() - restartedAt < restartLoopWindow
+		if (config.restart.automatic.get() && !looping && !this.isDebugging()) return true
+		const which =
+			names.length > 3 ? `${names.slice(0, 3).join(', ')}, …` : names.join(', ')
+		const msg = looping
+			? `direnv: Environment changed again right after restarting extensions (${which}). ` +
+				'The direnv output lists the changed variables. Restart again?'
+			: `direnv: Environment updated. Restart extensions (${which})?`
+		const choice = await vscode.window.showWarningMessage(msg, 'Restart')
 		return choice === 'Restart'
 	}
+
+	// restarting would end debug sessions, adapters often run in the extension host
+	private isDebugging() {
+		return vscode.debug.activeDebugSession !== undefined
+	}
+
+	private async restart() {
+		await this.cache.update(Cached.restartedAt, Date.now())
+		// restarting a remote extension host drops the connection (#95, still in VS Code 1.141)
+		if (vscode.env.remoteName === undefined) {
+			await vscode.commands.executeCommand('workbench.action.restartExtensionHost')
+		} else {
+			await vscode.commands.executeCommand('workbench.action.reloadWindow')
+		}
+	}
+}
+
+function nameOf(extension: vscode.Extension<unknown>) {
+	const { displayName } = extension.packageJSON as { displayName?: unknown }
+	if (typeof displayName !== 'string') return extension.id
+	// localized names are placeholders like %displayName%
+	if (displayName.startsWith('%')) return extension.id
+	return displayName
 }
 
 function message(err: unknown) {
